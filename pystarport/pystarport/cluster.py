@@ -3,11 +3,16 @@ import datetime
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 
+import docker
 import durations
 import jsonmerge
 import tomlkit
@@ -20,6 +25,10 @@ from . import ports
 from .utils import build_cli_args_safe, interact, write_ini
 
 CHAIN = "chain-maind"  # edit by nix-build
+ZEMU_HOST = "127.0.0.1"
+ZEMU_BUTTON_PORT = 9997
+# dockerfile is integration_test/hardware_wallet/Dockerfile
+ZEMU_IMAGE = "cryptocom/builder-zemu:latest"
 IMAGE = "docker.pkg.github.com/crypto-com/chain-main/chain-main-pystarport:latest"
 
 COMMON_PROG_OPTIONS = {
@@ -38,6 +47,81 @@ def home_dir(data_dir, i):
     return data_dir / f"node{i}"
 
 
+class Ledger:
+    def __init__(self):
+        self.ledger_name = f"ledger_simulator_{uuid.uuid4().time_mid}"
+        self.proxy_name = f"ledger_proxy_{uuid.uuid4().time_mid}"
+        self.grpc_name = f"ledger_grpc_server_{uuid.uuid4().time_mid}"
+        self.cmds = {
+            self.ledger_name: [
+                "./speculos/speculos.py",
+                "--display=headless",
+                f"--button-port={ZEMU_BUTTON_PORT}",
+                "./speculos/apps/crypto.elf",
+            ],
+            self.proxy_name: ["./speculos/tools/ledger-live-http-proxy.py", "-v"],
+            self.grpc_name: ["bash", "-c", "RUST_LOG=debug zemu-grpc-server"],
+        }
+        self.client = docker.from_env()
+        self.client.images.pull(ZEMU_IMAGE)
+        self.containers = []
+
+    def start(self):
+        for (name, cmd) in self.cmds.items():
+            try:
+                host_config = self.client.api.create_host_config(
+                    auto_remove=True,
+                    network_mode="host",
+                )
+                container = self.client.api.create_container(
+                    ZEMU_IMAGE,
+                    cmd,
+                    name=name,
+                    host_config=host_config,
+                )
+                self.client.api.start(container["Id"])
+                self.containers.append(container)
+                time.sleep(2)
+            except Exception as e:
+                print(e)
+
+    def stop(self):
+        for container in self.containers:
+            try:
+                self.client.api.remove_container(container["Id"], force=True)
+                print("stop docker {}".format(container["Name"]))
+            except Exception as e:
+                print(e)
+
+
+class LedgerButton:
+    def __init__(self, zemu_address, zemu_button_port):
+        self._client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.zemu_address = zemu_address
+        self.zemu_button_port = zemu_button_port
+        self.connected = False
+
+    @property
+    def client(self):
+        if not self.connected:
+            time.sleep(5)
+            self._client.connect((self.zemu_address, self.zemu_button_port))
+            self.connected = True
+        return self._client
+
+    def press_left(self):
+        data = "Ll"
+        self.client.send(data.encode())
+
+    def press_right(self):
+        data = "Rr"
+        self.client.send(data.encode())
+
+    def press_both(self):
+        data = "LRlr"
+        self.client.send(data.encode())
+
+
 class ChainCommand:
     def __init__(self, cmd=None):
         self.cmd = cmd or CHAIN
@@ -51,13 +135,22 @@ class ChainCommand:
 class ClusterCLI:
     "the apis to interact with wallet and blockchain prepared with Cluster"
 
-    def __init__(self, data_dir, cmd=None):
+    def __init__(
+        self,
+        data_dir,
+        cmd=None,
+        zemu_address=ZEMU_HOST,
+        zemu_button_port=ZEMU_BUTTON_PORT,
+    ):
         self.data_dir = data_dir
         self._genesis = json.load(open(data_dir / "genesis.json"))
         self.config = json.load((data_dir / "config.json").open())
         self.chain_id = self._genesis["chain_id"]
         self.raw = ChainCommand(cmd)
         self._supervisorctl = None
+        self.leger_button = LedgerButton(zemu_address, zemu_button_port)
+        self.output = None
+        self.error = None
 
     @property
     def supervisor(self):
@@ -173,6 +266,35 @@ class ClusterCLI:
             keyring_backend="test",
         )
         return json.loads(output)
+
+    def create_account_ledger(self, name, i=0):
+        "create new ledger keypair"
+
+        def send_request():
+            try:
+                self.output = self.raw(
+                    "keys",
+                    "add",
+                    name,
+                    "--ledger",
+                    home=self.home(i),
+                    output="json",
+                    keyring_backend="test",
+                )
+            except Exception as e:
+                self.error = e
+
+        t = threading.Thread(target=send_request)
+        t.start()
+        time.sleep(3)
+        for _ in range(0, 3):
+            self.leger_button.press_right()
+            time.sleep(0.2)
+        self.leger_button.press_both()
+        t.join()
+        if self.error:
+            raise self.error
+        return json.loads(self.output)
 
     def init(self, i):
         "the i-th node's config is already added"
@@ -314,6 +436,43 @@ class ClusterCLI:
                 fees=fees,
             )
         )
+
+    def transfer_from_ledger(
+        self, from_, to, coins, i=0, generate_only=False, fees=None
+    ):
+        def send_request():
+            try:
+                self.output = self.raw(
+                    "tx",
+                    "bank",
+                    "send",
+                    from_,
+                    to,
+                    coins,
+                    "-y",
+                    "--generate-only" if generate_only else "",
+                    "--ledger",
+                    home=self.home(i),
+                    keyring_backend="test",
+                    chain_id=self.chain_id,
+                    node=self.node_rpc(0),
+                    fees=fees,
+                    sign_mode="amino-json",
+                )
+            except Exception as e:
+                self.error = e
+
+        t = threading.Thread(target=send_request)
+        t.start()
+        time.sleep(3)
+        for _ in range(0, 11):
+            self.leger_button.press_right()
+            time.sleep(0.4)
+        self.leger_button.press_both()
+        t.join()
+        if self.error:
+            raise self.error
+        return json.loads(self.output)
 
     def get_delegated_amount(self, which_addr, i=0):
         return json.loads(
@@ -639,8 +798,33 @@ def init_cluster(
     """
     init data directory
     """
+
+    def create_account(cli, account, accounts, use_ledger=False):
+        if use_ledger:
+            acct = cli.create_account_ledger(account["name"])
+        else:
+            acct = cli.create_account(account["name"])
+        print(acct)
+        accounts.append(account)
+        vesting = account.get("vesting")
+        if not vesting:
+            cli.add_genesis_account(acct["address"], account["coins"])
+        else:
+            genesis_time = isoparse(genesis["genesis_time"])
+            end_time = genesis_time + datetime.timedelta(
+                seconds=durations.Duration(vesting).to_seconds()
+            )
+            vend = end_time.replace(tzinfo=None).isoformat("T") + "Z"
+            cli.add_genesis_account(
+                acct["address"],
+                account["coins"],
+                vesting_amount=account["coins"],
+                vesting_end_time=vend,
+            )
+
     process_config(config, base_port)
     json.dump(config, (data_dir / "config.json").open("w"))
+
     cmd = cmd or CHAIN
 
     # init home directories
@@ -681,25 +865,14 @@ def init_cluster(
         cli.add_genesis_account(account["address"], node["coins"], i)
         cli.gentx("validator", node["staked"], i)
 
+    # create accounts
     for account in config["accounts"]:
-        acct = cli.create_account(account["name"])
-        print(acct)
-        accounts.append(acct)
-        vesting = account.get("vesting")
-        if not vesting:
-            cli.add_genesis_account(acct["address"], account["coins"])
-        else:
-            genesis_time = isoparse(genesis["genesis_time"])
-            end_time = genesis_time + datetime.timedelta(
-                seconds=durations.Duration(vesting).to_seconds()
-            )
-            vend = end_time.replace(tzinfo=None).isoformat("T") + "Z"
-            cli.add_genesis_account(
-                acct["address"],
-                account["coins"],
-                vesting_amount=account["coins"],
-                vesting_end_time=vend,
-            )
+        create_account(cli, account, accounts)
+
+    account_hw = config.get("hw_account")
+    if account_hw:
+        create_account(cli, account_hw, accounts, True)
+
     # output accounts
     (data_dir / "accounts.txt").write_text(
         "\n".join(str(account) for account in accounts)
@@ -789,6 +962,7 @@ def edit_tm_cfg(path, base_port, peers):
     doc["p2p"]["addr_book_strict"] = False
     doc["p2p"]["allow_duplicate_ip"] = True
     doc["consensus"]["timeout_commit"] = "1s"
+    doc["rpc"]["timeout_broadcast_tx_commit"] = "30s"
     open(path, "w").write(tomlkit.dumps(doc))
 
 
